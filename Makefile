@@ -3,15 +3,14 @@ OBJS = $(patsubst %.c, %, $(SRC))
 LIBS = -lm -lpthread
 CC = mpicc
 
+
 all: $(OBJS)
-	
-#	mpicc -o pagerank_O2O pagerank_O2O.c
-#	mpicc -o pagerank_2Dpartition pagerank_2Dpartition.c -lm
-#	mpicc -o pagerank_2Dpartition_sq_processors pagerank_2Dpartition_sq_processors.c -lm
-#	gcc -o csr_reader csr_reader.c -lm
+	$(CC) $(CFLAGS) -o pagerank_1D_par pagerank_1D_par.o common.o $(LIBS)
+	$(CC) $(CFLAGS) -o pagerank_2D_par pagerank_2D_par.o common.o $(LIBS)
+	$(CC) $(CFLAGS) -o pagerank_2D_par_sqp pagerank_2D_par_sqp.o common.o $(LIBS)
 
 %: %.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+	$(CC) $(CFLAGS) -c $< $(LIBS)
 
 clean:
 	rm -rf $(OBJS)

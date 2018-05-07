@@ -6,17 +6,14 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <ctype.h>
+#include "common.h"
 
-#define DEBUG
+//#define DEBUG
 #define ERROR   (0.00001f)
 #define ALPHA   (0.85f)
 
-
-void debug_print_int(int process, int size, int *arr);
-void debug_print_double(int process, int size, double *arr);
-
 void ReadMatrix(char *filename,int *dimension, int *num_entry,
-                int **rowind, int **colind, double **values);
+                int **rowind, int **colind, double **values, int verbose);
 void SplitMatrixByRow(int dimension, int num_entry, int num_rowblocks,
                       int num_colblocks, int *from_rowind,
                       int *from_colind, double *from_values, int *value_count,
@@ -28,11 +25,6 @@ int SplitBlockByColumn( MPI_Comm *comm, int dimension, const int num_colblocks,
 void compute_blocksize(int dimension, int rank, int num_rowblocks,
                       int num_colblocks, int *row_size, int *col_size);
 void get_row_col_numblocks(int num_process, int *num_rowblocks, int *num_colblocks);
-
-
-void readfile(char *filename, int *n, int *m,
-              int **rowind, int **colind, double **values);
-double sup_norm(int size, double *v1, double *v2);
 
 int main(int argc, char **argv)
 {
@@ -61,73 +53,36 @@ int main(int argc, char **argv)
   int stop_flag = 0;
   int *rowwise_sendcounts, *rowwise_displs, *colwise_sendcounts, *colwise_displs;
 
-  /* Data structures for timing */
-	double start_time, end_time;
-	struct timeval tz;
-	struct timezone tx;
-
   /* MPI groups and communicators */
   int *row_root_group_idx, *col_root_group_idx;
   int root = 0;
   MPI_Comm row_comm, col_comm, row_root_comm, col_root_comm;
   MPI_Group world_group, row_root_group, col_root_group;
 
-  /* For reading options */
-  char c, *input_name, *output_name;
+  /* Options use */
+  Options *options;
   FILE *fd;
-  input_name = output_name = NULL;
-
-  /* Read options */
-  while ((c=getopt(argc,argv,"i:o:")) != -1){
-    switch (c)
-    {
-      case 'i':
-        input_name = optarg;
-        break;
-      case 'o':
-        output_name = optarg;
-        break;
-      case '?':
-        if (optopt == 'i' || optopt == 'o')
-          fprintf (stderr, "Option -%c requires an argument.\n", optopt);
-        else if (isprint(optopt))
-          fprintf (stderr, "Unknown option `-%c'.\n", optopt);
-        else
-          fprintf (stderr,"Unknown option character `\\x%x'.\n",optopt);
-        return 1;
-      default:
-        abort();
-    }
-  }
 
   /* Initialize the MPI environment */
   MPI_Init(NULL, NULL);
   MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
+  /* Read options */
+  init_options(&options);
+  if (!world_rank){
+    if (read_options(argc,argv,options)){
+      MPI_Abort(MPI_COMM_WORLD,1);
+      return -1;
+    }
+  }
+
   /* Decide split size */
   get_row_col_numblocks(world_size,&num_rowblocks,&num_colblocks);
 
   /* Load data from file */
-  ReadMatrix(input_name,&dimension,&num_entry,
-              &from_rowind,&from_colind,&from_values);
-
-
-  /* Test columns sum of dataset */
-#ifdef DEBUG
-  // if (!world_rank){
-  //   double *col_sum = (double *)malloc(sizeof(double)*dimension);
-  //   int col = 0;
-  //   for(i=0;i<dimension;i++)
-  //     col_sum[i] = 0.0f;
-  //   for (i=0;i<num_entry;i++){
-  //     col_sum[from_colind[i]] += from_values[i];
-  //   }
-  //   for(i=0;i<dimension;i++)
-  //     printf("[process %d]: column %d sum = %lf\n",world_rank,i,col_sum[i]);
-  // }
-  // MPI_Finalize();
-#endif
+  ReadMatrix(options->input_name,&dimension,&num_entry,
+              &from_rowind,&from_colind,&from_values,options->verbose);
 
   /* Create row and column groups */
   MPI_Comm_split( MPI_COMM_WORLD, world_rank / num_colblocks,
@@ -231,9 +186,10 @@ int main(int argc, char **argv)
   }
 
   /* PageRank main algorithm */
+  iter = 1;
   do{
-    if (!world_rank)
-      printf("iteration = %d\n",iter);
+    if (!world_rank && options->verbose)
+      printf("iteration %d\n",iter);
 
 
     /* Split the vector into blocks */
@@ -299,9 +255,21 @@ int main(int argc, char **argv)
           re_y[rowwise_displs[i % num_rowblocks] + (i / num_rowblocks)];
         }
 
+        /* If convergence, quit */
         total_sum = sup_norm(dimension,x,y);
         if (total_sum < ERROR)
           stop_flag = 1;
+
+        /* If overtime, quit */
+        gettimeofday(&tz, &tx);
+        end_time = (double)tz.tv_sec + (double) tz.tv_usec / 1000000.0;
+        if (options->time_limit > 0 && options->time_limit <= (end_time-start_time))
+          stop_flag = 1;
+
+        /* If max iteration reached, quit */
+        if (options->max_iter > 0 && options->max_iter == iter)
+          stop_flag = 1;
+
         memcpy(x,y,sizeof(double)*dimension);
       }
     }
@@ -314,17 +282,15 @@ int main(int argc, char **argv)
     iter += 1;
   } while (1);
 
+
   /* Print total time elapsed */
-  if (!world_rank){
-    gettimeofday(&tz, &tx);
-  	end_time = (double)tz.tv_sec + (double) tz.tv_usec / 1000000.0;
-  	printf("time per message = %lf seconds\n", (end_time - start_time));
-  }
+  if (!world_rank && options->verbose)
+    printf("time elapsed = %lf seconds\n", (end_time - start_time));
 
   /* Output to file or printout */
   if (!world_rank){
-    if (output_name){
-      fd = fopen(output_name,"w");
+    if (options->output_name){
+      fd = fopen(options->output_name,"w");
       fprintf(fd,"%d\n",dimension);
       for (i=0;i<dimension;i++){
         j = colwise_displs[i % num_colblocks] + (i / num_colblocks);
@@ -333,6 +299,7 @@ int main(int argc, char **argv)
       fclose(fd);
     }
     else{
+      printf("The resulting vector is:\n");
       for (i=0;i<dimension;i++){
         j = colwise_displs[i % num_colblocks] + (i / num_colblocks);
         printf("%lf\n",x[j]);
@@ -398,7 +365,7 @@ int main(int argc, char **argv)
  *
  */
 void ReadMatrix(char *filename,int *dimension, int *num_entry,
-                int **rowind, int **colind, double **values)
+                int **rowind, int **colind, double **values, int verbose)
 {
   int world_rank, world_size;
 
@@ -407,7 +374,7 @@ void ReadMatrix(char *filename,int *dimension, int *num_entry,
 
   if (!world_rank){
     /* read the whole matrix */
-    readfile(filename,dimension,num_entry,rowind,colind,values);
+    get_matrix(filename,dimension,num_entry,rowind,colind,values,verbose);
   }
   return;
 }
@@ -730,133 +697,6 @@ void compute_blocksize( int dimension, int rank, int num_rowblocks,
     *col_size = dimension / num_colblocks + 1;
   else
     *col_size = dimension / num_colblocks;
-}
-
-/*
- *  Summary:
- *      Implementation of reading matrix from files
- *
- *  Input Parameters:
- *      filename:  file name
- *
- *  Output Parameters:
- *      n:      dimension of the matrix
- *      m:      number of nonzero entries
- *      rowind: array of row indices
- *      colind: array of column indices
- *      values: array of values
- *
- */
-void readfile(char *filename, int *n, int *m,
-              int **rowind, int **colind, double **values)
-{
-	FILE *fp=fopen(filename,"r");
-	char buf[200];
-	int i,j,k,l;
-	int p,q;
-	double w;
-  int previous_row = 0;
-  int splitter_idx = 0;
-	if ((fp=fopen(filename,"r"))==NULL){
-	  fprintf(stderr,"Open file errer, check filename please.\n");
-	}
-
-  /* matrix dimension and number of nonzero entries */
-	fgets(buf,200,fp);
-	*n=atoi(buf);
-	l=0;
-	while(buf[l++]!=' ');
-	*m=atoi(&buf[l]);
-	printf("Matrix size: %d, #Non-zeros: %d\n",*n,*m);
-
-  /* sparse matrix */
-	(*rowind)=(int*)malloc(sizeof(int)*(*m));
-	(*colind)=(int*)malloc(sizeof(int)*(*m));
-	(*values)=(double*)malloc(sizeof(double)*(*m));
-	k=-1;
-	for(i=0;i<(*m);i++){
-	  fgets(buf,200,fp);
-	  l=0;p=atoi(&buf[l]);
-	  while(buf[l++]!=' '); q=atoi(&buf[l]);
-	  while(buf[l++]!=' '); w=atof(&buf[l]);
-
-	  (*values)[i]=w;
-	  (*colind)[i]=q;
-	  (*rowind)[i]=p;
-	}
-
-	fclose(fp);
-}
-
-/*
- *  Summary:
- *      Compute the sup norm of 2 vectors
- *
- *  Input Parameters:
- *      size: size of vectors
- *      v1:   array1
- *      v2:   array2
- *
- *  Return:
- *      sup norm of array1 and array2
- *
- */
-double sup_norm(int size, double *v1, double *v2)
-{
-  int i;
-  double diff;
-  double ret = 0.0f;
-  for (i=0;i<size;i++){
-    diff = v1[i] - v2[i];
-    diff = ((diff > 0) - (diff < 0)) * diff;
-    if (diff > ret)
-      ret = diff;
-  }
-  return ret;
-}
-
-/*
- *  Summary:
- *      Print values of vector
- *
- *  Input Parameters:
- *      process:  processor id
- *      size:     size of array
- *      arr:      array to print
- *
- */
-void debug_print_int(int process, int size, int *arr)
-{
-  int i;
-  char output[256], *pos = output;
-  pos += sprintf(pos,"[process %d]: ", process);
-  for (i=0;i<size;i++){
-    pos += sprintf(pos,"%d ",arr[i]);
-  }
-  pos += sprintf(pos,"\n");
-  printf("%s",output);
-}
-
-/*
- *  Summary:
- *      Print values of vector
- *
- *  Input Parameters:
- *      process:  processor id
- *      size:     size of array
- *      arr:      array to print
- *
- */
-void debug_print_double(int process, int size, double *arr)
-{
-  int i;
-  char output[256], *pos = output;
-  pos += sprintf(pos,"[process %d]: ", process);
-  for (i=0;i<size;i++){
-    pos += sprintf(pos,"%lf ",arr[i]);
-  }
-  pos += sprintf(pos,"\n");
-  printf("%s",output);
 }
 
 /*
